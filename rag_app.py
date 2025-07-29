@@ -2,8 +2,7 @@ import streamlit as st
 import fitz  # PyMuPDF
 import os
 import numpy as np
-import chromadb
-from chromadb.config import Settings
+import faiss
 import uuid
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances, manhattan_distances
 from scipy.spatial.distance import jaccard, hamming
@@ -28,7 +27,9 @@ except:
 # === CONFIGURATION ===
 EXTRACTED_TEXT_FILE = "extracted_text.txt"
 PROCESSED_TEXT_FILE = "processed_text.txt"
-DB_PATH = "./chroma_db"
+FAISS_INDEX_FILE = "faiss_index.bin"
+DOCUMENTS_FILE = "documents.pkl"
+METADATA_FILE = "metadata.pkl"
 
 # API Configuration
 EMBEDDING_API_URL = "https://embeddings-service.up.railway.app"
@@ -248,7 +249,7 @@ def extract_text_from_pdf(pdf_file):
             except:
                 pass
 
-# === STEP 2: TEXT PREPROCESSING AND VECTOR DB STORAGE ===
+# === STEP 2: TEXT PREPROCESSING AND FAISS VECTOR STORAGE ===
 def preprocess_text(text):
     """Lemmatize and stem the text"""
     try:
@@ -299,10 +300,10 @@ def chunk_text(text, chunk_size=500, overlap=100):
     
     return chunks
 
-def store_in_vector_db(processed_text):
-    """Convert to embeddings using API and store in ChromaDB"""
+def store_in_faiss_db(processed_text):
+    """Convert to embeddings using API and store in FAISS"""
     try:
-        st.info("🔄 Step 2: Processing text and storing in vector database...")
+        st.info("🔄 Step 2: Processing text and storing in FAISS vector database...")
         
         # Check embedding service
         service_ready, health_data = initialize_embedding_service()
@@ -318,38 +319,31 @@ def store_in_vector_db(processed_text):
             st.error("❌ No chunks created from text")
             return False, 0
         
-        # Test API connectivity
+        # Test API connectivity and get embedding dimension
         st.info("🔗 Testing embedding API...")
         test_embedding = get_embedding_from_api("test connection")
         if test_embedding is None:
             st.error("❌ Cannot generate test embedding from API")
             return False, 0
         else:
-            st.success(f"✅ API working! Embedding dimension: {len(test_embedding)}")
+            embedding_dim = len(test_embedding)
+            st.success(f"✅ API working! Embedding dimension: {embedding_dim}")
         
-        # Initialize ChromaDB
+        # Initialize FAISS index
         try:
-            chroma_client = chromadb.PersistentClient(path=DB_PATH)
+            # Use IndexFlatIP for inner product (cosine similarity with normalized vectors)
+            # You can also use IndexFlatL2 for L2 distance
+            index = faiss.IndexFlatIP(embedding_dim)
+            st.success("✅ FAISS index initialized")
             
-            # Delete existing collection if it exists
-            try:
-                chroma_client.delete_collection("pdf_documents")
-                st.info("🗑️ Cleared existing collection")
-            except:
-                pass
-            
-            # Create new collection
-            collection = chroma_client.create_collection("pdf_documents")
-            st.success("✅ ChromaDB collection created")
-            
-        except Exception as db_error:
-            st.error(f"❌ ChromaDB error: {str(db_error)}")
+        except Exception as faiss_error:
+            st.error(f"❌ FAISS initialization error: {str(faiss_error)}")
             return False, 0
         
         # Process chunks with API calls
         embeddings = []
         valid_chunks = []
-        chunk_ids = []
+        chunk_metadata = []
         failed_chunks = 0
         
         progress_bar = st.progress(0)
@@ -370,9 +364,15 @@ def store_in_vector_db(processed_text):
             embedding = get_embedding_from_api(chunk)
             
             if embedding is not None:
-                embeddings.append(embedding.tolist())
+                # Normalize embedding for cosine similarity with IndexFlatIP
+                embedding_normalized = embedding / np.linalg.norm(embedding)
+                embeddings.append(embedding_normalized)
                 valid_chunks.append(chunk)
-                chunk_ids.append(f"chunk_{i}_{str(uuid.uuid4())[:8]}")
+                chunk_metadata.append({
+                    'id': f"chunk_{i}_{str(uuid.uuid4())[:8]}",
+                    'chunk_index': i,
+                    'text_length': len(chunk)
+                })
                 
                 # Small delay to avoid overwhelming the API
                 time.sleep(0.1)
@@ -389,17 +389,27 @@ def store_in_vector_db(processed_text):
         progress_bar.empty()
         status_text.empty()
         
-        # Store in ChromaDB if we have valid embeddings
+        # Store in FAISS if we have valid embeddings
         if valid_chunks and embeddings:
             try:
-                collection.add(
-                    embeddings=embeddings,
-                    documents=valid_chunks,
-                    ids=chunk_ids
-                )
+                # Convert embeddings to numpy array
+                embeddings_array = np.array(embeddings).astype('float32')
+                
+                # Add to FAISS index
+                index.add(embeddings_array)
+                
+                # Save FAISS index
+                faiss.write_index(index, FAISS_INDEX_FILE)
+                
+                # Save documents and metadata separately
+                with open(DOCUMENTS_FILE, 'wb') as f:
+                    pickle.dump(valid_chunks, f)
+                
+                with open(METADATA_FILE, 'wb') as f:
+                    pickle.dump(chunk_metadata, f)
                 
                 st.success(f"✅ Step 2 Complete!")
-                st.success(f"📊 Successfully stored {len(valid_chunks)} embeddings")
+                st.success(f"📊 Successfully stored {len(valid_chunks)} embeddings in FAISS")
                 
                 if failed_chunks > 0:
                     st.warning(f"⚠️ {failed_chunks} chunks failed to process")
@@ -413,10 +423,16 @@ def store_in_vector_db(processed_text):
                 with col3:
                     st.metric("Failed", failed_chunks)
                 
+                # Show FAISS index info
+                st.info(f"📊 FAISS Index Info:")
+                st.info(f"- Dimension: {index.d}")
+                st.info(f"- Total vectors: {index.ntotal}")
+                st.info(f"- Index type: {type(index).__name__}")
+                
                 return True, len(valid_chunks)
                 
             except Exception as store_error:
-                st.error(f"❌ Error storing in ChromaDB: {str(store_error)}")
+                st.error(f"❌ Error storing in FAISS: {str(store_error)}")
                 return False, 0
         else:
             st.error("❌ No valid embeddings created")
@@ -460,8 +476,10 @@ def process_user_query(query):
         query_embedding = get_embedding_from_api(processed_query)
         
         if query_embedding is not None:
+            # Normalize for cosine similarity
+            query_embedding_normalized = query_embedding / np.linalg.norm(query_embedding)
             st.success("✅ Step 3 Complete: Query converted to embedding via API")
-            return query_embedding, processed_query
+            return query_embedding_normalized, processed_query
         else:
             st.error("❌ Failed to get query embedding from API")
             return None, processed_query
@@ -470,7 +488,7 @@ def process_user_query(query):
         st.error(f"❌ Error in Step 3: {str(e)}")
         return None, query
 
-# === STEP 4 & 5: SIMILARITY COMPARISON ===
+# === STEP 4 & 5: SIMILARITY COMPARISON WITH FAISS ===
 def compute_all_similarities(query_embedding, doc_embeddings):
     """Compute multiple similarity metrics"""
     try:
@@ -522,87 +540,135 @@ def compute_all_similarities(query_embedding, doc_embeddings):
         st.error(f"❌ Error computing similarities: {str(e)}")
         return None
 
-def search_similar_documents(query_embedding, top_k=5):
-    """Search for similar documents in ChromaDB"""
+def search_similar_documents_faiss(query_embedding, top_k=5):
+    """Search for similar documents using FAISS"""
     try:
-        st.info("🔍 Step 4-5: Comparing with stored embeddings...")
+        st.info("🔍 Step 4-5: Searching with FAISS...")
         
-        # Connect to ChromaDB
-        chroma_client = chromadb.PersistentClient(path=DB_PATH)
-        collection = chroma_client.get_collection("pdf_documents")
+        # Check if FAISS index files exist
+        if not os.path.exists(FAISS_INDEX_FILE):
+            st.error("❌ FAISS index file not found. Please process a PDF first.")
+            return None
         
-        # Get all stored data
-        all_data = collection.get(include=['embeddings', 'documents'])
+        if not os.path.exists(DOCUMENTS_FILE):
+            st.error("❌ Documents file not found. Please process a PDF first.")
+            return None
         
-        # Fix the problematic condition check
-        embeddings = all_data.get('embeddings', [])
-        documents = all_data.get('documents', [])
+        if not os.path.exists(METADATA_FILE):
+            st.error("❌ Metadata file not found. Please process a PDF first.")
+            return None
         
-        # Safely check if embeddings exist and are not empty
+        # Load FAISS index
         try:
-            embeddings_len = len(embeddings) if embeddings is not None else 0
-        except (TypeError, AttributeError):
-            embeddings_len = 0
-            
-        if embeddings is None or embeddings_len == 0:
-            st.error("❌ No embeddings found in database")
+            index = faiss.read_index(FAISS_INDEX_FILE)
+            st.info(f"📊 Loaded FAISS index with {index.ntotal} vectors")
+        except Exception as faiss_error:
+            st.error(f"❌ Error loading FAISS index: {str(faiss_error)}")
             return None
-            
-        # Safely check if documents exist and are not empty
+        
+        # Load documents and metadata
         try:
-            documents_len = len(documents) if documents is not None else 0
-        except (TypeError, AttributeError):
-            documents_len = 0
+            with open(DOCUMENTS_FILE, 'rb') as f:
+                documents = pickle.load(f)
             
-        if documents is None or documents_len == 0:
-            st.error("❌ No documents found in database")
+            with open(METADATA_FILE, 'rb') as f:
+                metadata = pickle.load(f)
+                
+            st.info(f"📊 Loaded {len(documents)} documents")
+        except Exception as load_error:
+            st.error(f"❌ Error loading documents/metadata: {str(load_error)}")
             return None
+        
+        # Ensure we have embeddings to compare against
+        if index.ntotal == 0:
+            st.error("❌ FAISS index is empty")
+            return None
+        
+        if len(documents) != index.ntotal:
+            st.error(f"❌ Mismatch: {len(documents)} documents vs {index.ntotal} vectors in index")
+            return None
+        
+        # Prepare query embedding for FAISS search
+        query_emb = np.array(query_embedding).astype('float32').reshape(1, -1)
+        
+        # Perform FAISS search
+        try:
+            # Search with FAISS (this gives us cosine similarity scores since we used IndexFlatIP)
+            faiss_scores, faiss_indices = index.search(query_emb, min(top_k, index.ntotal))
             
-        if embeddings_len != documents_len:
-            st.error(f"❌ Mismatch between embeddings ({embeddings_len}) and documents ({documents_len}) count")
+            # Flatten the results
+            faiss_scores = faiss_scores.flatten()
+            faiss_indices = faiss_indices.flatten()
+            
+            st.info(f"📊 FAISS search completed")
+            st.info(f"📊 Query embedding shape: {query_emb.shape}")
+            
+        except Exception as search_error:
+            st.error(f"❌ FAISS search error: {str(search_error)}")
             return None
         
-        # Convert embeddings to numpy array
-        doc_embeddings = np.array(embeddings)
-        query_emb = np.array(query_embedding)
+        # Get all embeddings for additional similarity metrics
+        try:
+            # Reconstruct embeddings from index (for IndexFlat types)
+            all_embeddings = np.zeros((index.ntotal, index.d), dtype='float32')
+            index.reconstruct_n(0, index.ntotal, all_embeddings)
+            
+        except Exception as reconstruct_error:
+            st.warning(f"⚠️ Could not reconstruct embeddings for additional metrics: {str(reconstruct_error)}")
+            # Fallback: only use FAISS results
+            results = {
+                'faiss_cosine': {
+                    'indices': faiss_indices,
+                    'scores': faiss_scores,
+                    'documents': [documents[i] for i in faiss_indices if i < len(documents)]
+                }
+            }
+            st.success("✅ Step 4-5 Complete: FAISS similarity search done")
+            return results
         
-        # Ensure proper shapes
-        if len(query_emb.shape) == 1:
-            query_emb = query_emb.reshape(1, -1)
-        if len(doc_embeddings.shape) == 1:
-            doc_embeddings = doc_embeddings.reshape(1, -1)
-        
-        st.info(f"📊 Query embedding shape: {query_emb.shape}")
-        st.info(f"📊 Document embeddings shape: {doc_embeddings.shape}")
-        
-        # Compute all similarity metrics
-        similarities = compute_all_similarities(query_emb.flatten(), doc_embeddings)
+        # Compute all similarity metrics using reconstructed embeddings
+        similarities = compute_all_similarities(query_embedding, all_embeddings)
         
         if similarities is None:
-            st.error("❌ Failed to compute similarities")
-            return None
-        
-        # Get top results for each metric
-        results = {}
-        for metric_name, scores in similarities.items():
-            # Ensure scores is a numpy array
-            scores_array = np.array(scores)
-            
-            # Get top indices
-            top_indices = np.argsort(-scores_array)[:top_k]
-            
-            # Build results
-            results[metric_name] = {
-                'indices': top_indices,
-                'scores': scores_array[top_indices],
-                'documents': [documents[i] for i in top_indices]
+            # Fallback to FAISS results only
+            results = {
+                'faiss_cosine': {
+                    'indices': faiss_indices,
+                    'scores': faiss_scores,
+                    'documents': [documents[i] for i in faiss_indices if i < len(documents)]
+                }
             }
+        else:
+            # Get top results for each metric
+            results = {}
+            
+            # Add FAISS results first
+            results['faiss_cosine'] = {
+                'indices': faiss_indices,
+                'scores': faiss_scores,
+                'documents': [documents[i] for i in faiss_indices if i < len(documents)]
+            }
+            
+            # Add other similarity metrics
+            for metric_name, scores in similarities.items():
+                # Ensure scores is a numpy array
+                scores_array = np.array(scores)
+                
+                # Get top indices
+                top_indices = np.argsort(-scores_array)[:top_k]
+                
+                # Build results
+                results[metric_name] = {
+                    'indices': top_indices,
+                    'scores': scores_array[top_indices],
+                    'documents': [documents[i] for i in top_indices if i < len(documents)]
+                }
         
-        st.success("✅ Step 4-5 Complete: Similarity comparison done")
+        st.success("✅ Step 4-5 Complete: FAISS similarity search and comparison done")
         return results
     
     except Exception as e:
-        st.error(f"❌ Error in similarity search: {str(e)}")
+        st.error(f"❌ Error in FAISS similarity search: {str(e)}")
         import traceback
         st.error(f"❌ Detailed error: {traceback.format_exc()}")
         return None
@@ -625,12 +691,21 @@ def display_similarity_results(results, original_query):
         with tab:
             st.markdown(f"### {metric_name.replace('_', ' ').title()} Results")
             
+            # Special handling for FAISS results
+            if metric_name == 'faiss_cosine':
+                st.info("🔍 These are the primary FAISS search results (optimized for speed)")
+            
             metric_results = results[metric_name]
             
             for i, (score, document) in enumerate(zip(metric_results['scores'], metric_results['documents'])):
                 with st.expander(f"Rank #{i+1} - Score: {score:.4f}", expanded=(i==0)):
                     st.markdown(f"**Similarity Score:** `{score:.4f}`")
                     st.markdown(f"**Document Index:** {metric_results['indices'][i]}")
+                    
+                    # Additional info for FAISS results
+                    if metric_name == 'faiss_cosine':
+                        st.markdown("**Source:** FAISS Vector Search")
+                    
                     st.markdown("**Content Preview:**")
                     
                     # Show first 1000 characters
@@ -656,14 +731,18 @@ def display_similarity_results(results, original_query):
     import pandas as pd
     summary_df = pd.DataFrame(summary_data).T
     st.dataframe(summary_df)
+    
+    # FAISS Performance Note
+    if 'faiss_cosine' in results:
+        st.info("💡 **FAISS Performance Note:** The 'Faiss Cosine' results are optimized for fast similarity search and should be your primary reference for document retrieval.")
 
 # === MAIN STREAMLIT APP ===
 def main():
-    st.set_page_config(page_title="Complete RAG Workflow - API Embeddings", layout="wide")
+    st.set_page_config(page_title="Complete RAG Workflow - FAISS", layout="wide")
     
     st.title("🤖 Complete RAG Workflow System")
-    st.markdown("*PDF Processing → Vector Storage → Query Processing → Similarity Search*")
-    st.markdown("**Using Google Gemini Embeddings API (Cloud-based)**")
+    st.markdown("*PDF Processing → FAISS Vector Storage → Query Processing → Similarity Search*")
+    st.markdown("**Using Google Gemini Embeddings API + FAISS Vector Database**")
     
     # Sidebar configuration and file upload
     st.sidebar.header("📁 PDF File Upload")
@@ -685,6 +764,13 @@ def main():
     chunk_size = st.sidebar.slider("Chunk Size", 200, 1000, 500)
     top_k = st.sidebar.slider("Top K Results", 1, 10, 5)
     
+    # FAISS Index Type Selection
+    index_type = st.sidebar.selectbox(
+        "FAISS Index Type",
+        ["IndexFlatIP", "IndexFlatL2", "IndexIVFFlat"],
+        help="IndexFlatIP: Inner Product (Cosine), IndexFlatL2: L2 Distance, IndexIVFFlat: Faster approximate search"
+    )
+    
     # API Status in sidebar
     st.sidebar.header("🌐 API Status")
     if st.sidebar.button("🔄 Check API Health"):
@@ -697,8 +783,8 @@ def main():
     # Initialize session state
     if 'pdf_processed' not in st.session_state:
         st.session_state.pdf_processed = False
-    if 'db_ready' not in st.session_state:
-        st.session_state.db_ready = False
+    if 'faiss_ready' not in st.session_state:
+        st.session_state.faiss_ready = False
     if 'current_file' not in st.session_state:
         st.session_state.current_file = None
     
@@ -707,7 +793,7 @@ def main():
         if st.session_state.current_file != uploaded_file.name:
             st.session_state.current_file = uploaded_file.name
             st.session_state.pdf_processed = False
-            st.session_state.db_ready = False
+            st.session_state.faiss_ready = False
             st.info(f"🔄 New file detected: {uploaded_file.name}")
     
     # Main content area
@@ -720,13 +806,20 @@ def main():
         3. **Ask Questions**: Enter your queries to search through the document
         4. **View Results**: Explore similarity results across different metrics
         
-        ### ⚡ Using Google Gemini Embeddings API
+        ### ⚡ Using Google Gemini Embeddings API + FAISS
         - **Higher Quality**: Google's advanced embedding model
+        - **Fast Search**: FAISS provides optimized vector similarity search
+        - **Multiple Metrics**: Compare results across different similarity measures
         - **Cloud-powered**: No local model download required
-        - **Internet Required**: Needs stable internet connection
-        - **Rate Limits**: Be aware of API rate limits and usage costs  
-        - **Performance**: May be slower than local models due to network latency
-        - **No Local Model**: This app does not use a local embedding model, all processing is done via API
+        - **Internet Required**: Needs stable internet connection for embeddings
+        - **Scalable**: FAISS can handle large document collections efficiently
+        
+        ### 🚀 FAISS Advantages:
+        - **Speed**: Much faster similarity search than traditional methods
+        - **Memory Efficient**: Optimized memory usage for large vector collections
+        - **Scalable**: Can handle millions of vectors
+        - **Multiple Index Types**: Choose the best index for your use case
+        - **GPU Support**: Can utilize GPU acceleration (if available)
         
         """)
     else:
@@ -744,14 +837,14 @@ def main():
                 if extracted_text:
                     st.session_state.pdf_processed = True
                     
-                    # Step 2: Preprocess and store
+                    # Step 2: Preprocess and store in FAISS
                     processed_text, sentences = preprocess_text(extracted_text)
                     
                     if processed_text:
-                        success, num_embeddings = store_in_vector_db(processed_text)
+                        success, num_embeddings = store_in_faiss_db(processed_text)
                         
                         if success:
-                            st.session_state.db_ready = True
+                            st.session_state.faiss_ready = True
                             
                             # Show summary
                             col1, col2, col3 = st.columns(3)
@@ -760,10 +853,10 @@ def main():
                             with col2:
                                 st.metric("Text Sentences", len(sentences))
                             with col3:
-                                st.metric("Stored Embeddings", num_embeddings)
+                                st.metric("FAISS Vectors", num_embeddings)
         
         # Steps 3-7: Query Processing
-        if st.session_state.db_ready:
+        if st.session_state.faiss_ready:
             st.header("💬 Query Processing (Steps 3-7)")
             
             user_query = st.text_input(
@@ -776,30 +869,72 @@ def main():
                 query_embedding, processed_query = process_user_query(user_query)
                 
                 if query_embedding is not None:
-                    # Steps 4-5: Search and compare
-                    search_results = search_similar_documents(query_embedding, top_k)
+                    # Steps 4-5: Search and compare using FAISS
+                    search_results = search_similar_documents_faiss(query_embedding, top_k)
                     
                     if search_results:
                         # Steps 6-7: Display results
                         display_similarity_results(search_results, user_query)
         
         elif st.session_state.pdf_processed:
-            st.info("⏳ PDF processed but database not ready. Please try processing again.")
+            st.info("⏳ PDF processed but FAISS database not ready. Please try processing again.")
         else:
             st.info("👆 Please process the uploaded PDF file first to enable querying.")
     
     # Status sidebar
     st.sidebar.header("📊 System Status")
     st.sidebar.success("✅ PDF Processed" if st.session_state.pdf_processed else "⏳ PDF Not Processed")
-    st.sidebar.success("✅ Database Ready" if st.session_state.db_ready else "⏳ Database Not Ready")
+    st.sidebar.success("✅ FAISS Ready" if st.session_state.faiss_ready else "⏳ FAISS Not Ready")
     
     # File status
     if os.path.exists(EXTRACTED_TEXT_FILE):
         st.sidebar.text("📄 extracted_text.txt ✅")
     if os.path.exists(PROCESSED_TEXT_FILE):
         st.sidebar.text("📄 processed_text.txt ✅")
-    if os.path.exists(DB_PATH):
-        st.sidebar.text("🗄️ ChromaDB ✅")
+    if os.path.exists(FAISS_INDEX_FILE):
+        st.sidebar.text("🗄️ FAISS Index ✅")
+    if os.path.exists(DOCUMENTS_FILE):
+        st.sidebar.text("📚 Documents ✅")
+    if os.path.exists(METADATA_FILE):
+        st.sidebar.text("📋 Metadata ✅")
+    
+    # FAISS Management
+    st.sidebar.header("🗄️ FAISS Management")
+    
+    if st.sidebar.button("🗑️ Clear FAISS Database"):
+        try:
+            files_to_remove = [FAISS_INDEX_FILE, DOCUMENTS_FILE, METADATA_FILE]
+            removed_files = []
+            
+            for file_path in files_to_remove:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    removed_files.append(file_path)
+            
+            if removed_files:
+                st.sidebar.success(f"✅ Cleared {len(removed_files)} FAISS files")
+                st.session_state.faiss_ready = False
+            else:
+                st.sidebar.info("ℹ️ No FAISS files to clear")
+                
+        except Exception as e:
+            st.sidebar.error(f"❌ Error clearing FAISS files: {str(e)}")
+    
+    # Display FAISS Index Info
+    if os.path.exists(FAISS_INDEX_FILE):
+        try:
+            index = faiss.read_index(FAISS_INDEX_FILE)
+            st.sidebar.header("📊 FAISS Index Info")
+            st.sidebar.text(f"Vectors: {index.ntotal}")
+            st.sidebar.text(f"Dimension: {index.d}")
+            st.sidebar.text(f"Type: {type(index).__name__}")
+            
+            # Calculate approximate memory usage
+            memory_mb = (index.ntotal * index.d * 4) / (1024 * 1024)  # 4 bytes per float32
+            st.sidebar.text(f"Memory: ~{memory_mb:.1f} MB")
+            
+        except Exception as e:
+            st.sidebar.error(f"Error reading FAISS info: {str(e)}")
 
 if __name__ == "__main__":
     main()
