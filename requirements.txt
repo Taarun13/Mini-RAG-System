@@ -1,0 +1,10 @@
+streamlit
+PyMuPDF
+numpy
+chromadb
+scikit-learn
+scipy
+nltk
+requests
+pandas
+time
