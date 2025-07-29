@@ -1,5 +1,6 @@
 import streamlit as st
-import fitz  # PyMuPDF
+# import fitz  # PyMuPDF - Alternative import below if needed
+import pdfplumber  # Alternative to PyMuPDF
 import os
 import numpy as np
 import faiss
@@ -19,9 +20,12 @@ import json
 # Download required NLTK data
 try:
     nltk.download('punkt', quiet=True)
+    nltk.download('punkt_tab', quiet=True)  # For newer NLTK versions
     nltk.download('wordnet', quiet=True)
     nltk.download('stopwords', quiet=True)
-except:
+    nltk.download('omw-1.4', quiet=True)  # For WordNet lemmatizer
+except Exception as e:
+    st.warning(f"⚠️ NLTK download warning: {str(e)}")
     pass
 
 # === CONFIGURATION ===
@@ -170,10 +174,40 @@ def initialize_embedding_service():
         st.error(f"❌ Error initializing embedding service: {str(e)}")
         return False, None
 
+# Initialize NLTK resources
+@st.cache_resource
+def initialize_nltk():
+    """Initialize NLTK resources with better error handling"""
+    try:
+        st.info("🔄 Initializing NLTK resources...")
+        
+        # Download required NLTK data with explicit error handling
+        downloads = [
+            ('punkt', 'Punkt tokenizer'),
+            ('punkt_tab', 'Punkt tokenizer (tabular)'),
+            ('wordnet', 'WordNet database'),
+            ('stopwords', 'Stop words'),
+            ('omw-1.4', 'Open Multilingual Wordnet')
+        ]
+        
+        success_count = 0
+        for resource, description in downloads:
+            try:
+                nltk.download(resource, quiet=True)
+                success_count += 1
+            except Exception as e:
+                st.warning(f"⚠️ Could not download {description}: {str(e)}")
+        
+        st.success(f"✅ NLTK initialized: {success_count}/{len(downloads)} resources loaded")
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Error initializing NLTK: {str(e)}")
+        return False
+
 # === STEP 1: PDF LOADING AND TEXT EXTRACTION ===
 def extract_text_from_pdf(pdf_file):
-    """Extract all contents from PDF and save to text file"""
-    doc = None
+    """Extract all contents from PDF and save to text file using pdfplumber"""
     try:
         st.info("📖 Step 1: Loading PDF and extracting text...")
         
@@ -183,35 +217,35 @@ def extract_text_from_pdf(pdf_file):
             tmp_path = tmp_file.name
         
         try:
-            # Open PDF document
-            doc = fitz.open(tmp_path)
-            total_pages = len(doc)
             full_text = ""
             
-            # Progress bar for extraction
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            # Extract text from each page
-            for page_num in range(total_pages):
-                status_text.text(f"Processing page {page_num + 1} of {total_pages}")
+            # Open PDF with pdfplumber
+            with pdfplumber.open(tmp_path) as pdf:
+                total_pages = len(pdf.pages)
                 
-                try:
-                    page = doc[page_num]
-                    page_text = page.get_text()
+                # Progress bar for extraction
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                # Extract text from each page
+                for page_num, page in enumerate(pdf.pages):
+                    status_text.text(f"Processing page {page_num + 1} of {total_pages}")
                     
-                    if page_text.strip():  # Only add non-empty pages
-                        full_text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
-                    
-                    progress_bar.progress((page_num + 1) / total_pages)
-                    
-                except Exception as page_error:
-                    st.warning(f"⚠️ Error processing page {page_num + 1}: {str(page_error)}")
-                    continue
-            
-            # Clear progress indicators
-            progress_bar.empty()
-            status_text.empty()
+                    try:
+                        page_text = page.extract_text()
+                        
+                        if page_text and page_text.strip():  # Only add non-empty pages
+                            full_text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+                        
+                        progress_bar.progress((page_num + 1) / total_pages)
+                        
+                    except Exception as page_error:
+                        st.warning(f"⚠️ Error processing page {page_num + 1}: {str(page_error)}")
+                        continue
+                
+                # Clear progress indicators
+                progress_bar.empty()
+                status_text.empty()
             
             # Check if we extracted any text
             if not full_text.strip():
@@ -240,34 +274,79 @@ def extract_text_from_pdf(pdf_file):
     except Exception as e:
         st.error(f"❌ Error in Step 1: {str(e)}")
         return None, 0
-    
-    finally:
-        # Always close the document if it was opened
-        if doc is not None:
-            try:
-                doc.close()
-            except:
-                pass
 
 # === STEP 2: TEXT PREPROCESSING AND FAISS VECTOR STORAGE ===
 def preprocess_text(text):
-    """Lemmatize and stem the text"""
+    """Lemmatize and stem the text with improved error handling"""
     try:
-        lemmatizer = WordNetLemmatizer()
-        stemmer = PorterStemmer()
-        stop_words = set(stopwords.words("english"))
+        # Initialize NLTK if not already done
+        initialize_nltk()
         
-        # Tokenize and process
-        sentences = sent_tokenize(text)
+        # Import with error handling
+        try:
+            lemmatizer = WordNetLemmatizer()
+            stemmer = PorterStemmer()
+            stop_words = set(stopwords.words("english"))
+        except Exception as nltk_error:
+            st.warning(f"⚠️ NLTK initialization issue: {str(nltk_error)}")
+            st.info("📝 Using basic text processing without advanced NLP...")
+            
+            # Fallback: simple text processing
+            sentences = text.split('.')
+            processed_sentences = []
+            
+            for sentence in sentences:
+                if sentence.strip() and len(sentence.strip()) > 10:
+                    # Basic cleaning
+                    clean_sentence = sentence.lower().strip()
+                    # Remove common stop words manually
+                    basic_stop_words = ['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should']
+                    words = clean_sentence.split()
+                    filtered_words = [word for word in words if word not in basic_stop_words and len(word) > 2]
+                    
+                    if filtered_words:
+                        processed_sentences.append(" ".join(filtered_words))
+            
+            processed_text = "\n".join(processed_sentences)
+            
+            # Save processed text
+            with open(PROCESSED_TEXT_FILE, "w", encoding="utf-8") as f:
+                f.write(processed_text)
+            
+            st.success("✅ Text preprocessing completed (basic mode)")
+            return processed_text, processed_sentences
+        
+        # Standard NLTK processing
+        try:
+            sentences = sent_tokenize(text)
+        except Exception:
+            # Fallback to simple sentence splitting
+            sentences = text.split('.')
+            sentences = [s.strip() for s in sentences if s.strip()]
+        
         processed_sentences = []
         
         for sentence in sentences:
-            tokens = word_tokenize(sentence.lower())
-            processed_tokens = [
-                stemmer.stem(lemmatizer.lemmatize(word))
-                for word in tokens
-                if word.isalnum() and word not in stop_words and len(word) > 2
-            ]
+            try:
+                # Try NLTK tokenization
+                tokens = word_tokenize(sentence.lower())
+            except Exception:
+                # Fallback to simple tokenization
+                tokens = sentence.lower().split()
+            
+            processed_tokens = []
+            for word in tokens:
+                try:
+                    if word.isalnum() and word not in stop_words and len(word) > 2:
+                        # Try lemmatization and stemming
+                        lemmatized = lemmatizer.lemmatize(word)
+                        stemmed = stemmer.stem(lemmatized)
+                        processed_tokens.append(stemmed)
+                except Exception:
+                    # Fallback: just add the word if it's alphanumeric and long enough
+                    if word.isalnum() and len(word) > 2:
+                        processed_tokens.append(word)
+            
             if processed_tokens:  # Only add non-empty sentences
                 processed_sentences.append(" ".join(processed_tokens))
         
@@ -277,11 +356,32 @@ def preprocess_text(text):
         with open(PROCESSED_TEXT_FILE, "w", encoding="utf-8") as f:
             f.write(processed_text)
         
+        st.success("✅ Text preprocessing completed (full NLTK mode)")
         return processed_text, processed_sentences
     
     except Exception as e:
         st.error(f"❌ Error in text preprocessing: {str(e)}")
-        return None, []
+        st.info("🔄 Attempting basic text processing...")
+        
+        # Emergency fallback
+        try:
+            sentences = text.split('.')
+            clean_sentences = []
+            for sentence in sentences:
+                if sentence.strip() and len(sentence.strip()) > 10:
+                    clean_sentences.append(sentence.strip().lower())
+            
+            processed_text = "\n".join(clean_sentences)
+            
+            with open(PROCESSED_TEXT_FILE, "w", encoding="utf-8") as f:
+                f.write(processed_text)
+            
+            st.warning("⚠️ Using emergency fallback text processing")
+            return processed_text, clean_sentences
+            
+        except Exception as fallback_error:
+            st.error(f"❌ Emergency fallback failed: {str(fallback_error)}")
+            return None, []
 
 def chunk_text(text, chunk_size=500, overlap=100):
     """Create overlapping chunks from text"""
