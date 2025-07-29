@@ -1,7 +1,7 @@
 streamlit
 PyMuPDF
 numpy
-faiss
+faiss-cpu
 scikit-learn
 scipy
 nltk
