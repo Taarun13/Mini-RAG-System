@@ -1,6 +1,20 @@
 import streamlit as st
 # import fitz  # PyMuPDF - Alternative import below if needed
-import pdfplumber  # Alternative to PyMuPDF
+# try:
+#     import pdfplumber  # Alternative to PyMuPDF
+#     PDF_LIBRARY = 'pdfplumber'
+# except ImportError:
+try:
+        import PyPDF2
+        PDF_LIBRARY = 'pypdf2'
+except ImportError:
+        try:
+            import fitz  # PyMuPDF
+            PDF_LIBRARY = 'pymupdf'
+        except ImportError:
+            PDF_LIBRARY = None
+            st.error("❌ No PDF library found. Please install one of: pdfplumber, PyPDF2, or PyMuPDF")
+
 import os
 import numpy as np
 import faiss
@@ -207,9 +221,13 @@ def initialize_nltk():
 
 # === STEP 1: PDF LOADING AND TEXT EXTRACTION ===
 def extract_text_from_pdf(pdf_file):
-    """Extract all contents from PDF and save to text file using pdfplumber"""
+    """Extract all contents from PDF using available PDF library"""
+    if PDF_LIBRARY is None:
+        st.error("❌ No PDF processing library available. Please install pdfplumber, PyPDF2, or PyMuPDF")
+        return None, 0
+    
     try:
-        st.info("📖 Step 1: Loading PDF and extracting text...")
+        st.info(f"📖 Step 1: Loading PDF and extracting text using {PDF_LIBRARY}...")
         
         # Create a temporary file to work with the uploaded PDF
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
@@ -218,23 +236,86 @@ def extract_text_from_pdf(pdf_file):
         
         try:
             full_text = ""
+            total_pages = 0
             
-            # Open PDF with pdfplumber
-            with pdfplumber.open(tmp_path) as pdf:
-                total_pages = len(pdf.pages)
+            # if PDF_LIBRARY == 'pdfplumber':
+            #     # Use pdfplumber
+            #     with pdfplumber.open(tmp_path) as pdf:
+            #         total_pages = len(pdf.pages)
+                    
+            #         # Progress bar for extraction
+            #         progress_bar = st.progress(0)
+            #         status_text = st.empty()
+                    
+            #         # Extract text from each page
+            #         for page_num, page in enumerate(pdf.pages):
+            #             status_text.text(f"Processing page {page_num + 1} of {total_pages}")
+                        
+            #             try:
+            #                 page_text = page.extract_text()
+                            
+            #                 if page_text and page_text.strip():  # Only add non-empty pages
+            #                     full_text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+                            
+            #                 progress_bar.progress((page_num + 1) / total_pages)
+                            
+            #             except Exception as page_error:
+            #                 st.warning(f"⚠️ Error processing page {page_num + 1}: {str(page_error)}")
+            #                 continue
+                    
+            #         # Clear progress indicators
+            #         progress_bar.empty()
+            #         status_text.empty()
+            
+            if PDF_LIBRARY == 'pypdf2':
+                # Use PyPDF2
+                with open(tmp_path, 'rb') as file:
+                    pdf_reader = PyPDF2.PdfReader(file)
+                    total_pages = len(pdf_reader.pages)
+                    
+                    # Progress bar for extraction
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    # Extract text from each page
+                    for page_num in range(total_pages):
+                        status_text.text(f"Processing page {page_num + 1} of {total_pages}")
+                        
+                        try:
+                            page = pdf_reader.pages[page_num]
+                            page_text = page.extract_text()
+                            
+                            if page_text and page_text.strip():  # Only add non-empty pages
+                                full_text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+                            
+                            progress_bar.progress((page_num + 1) / total_pages)
+                            
+                        except Exception as page_error:
+                            st.warning(f"⚠️ Error processing page {page_num + 1}: {str(page_error)}")
+                            continue
+                    
+                    # Clear progress indicators
+                    progress_bar.empty()
+                    status_text.empty()
+            
+            elif PDF_LIBRARY == 'pymupdf':
+                # Use PyMuPDF
+                doc = fitz.open(tmp_path)
+                total_pages = len(doc)
                 
                 # Progress bar for extraction
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
                 # Extract text from each page
-                for page_num, page in enumerate(pdf.pages):
+                for page_num in range(total_pages):
                     status_text.text(f"Processing page {page_num + 1} of {total_pages}")
                     
                     try:
-                        page_text = page.extract_text()
+                        page = doc[page_num]
+                        page_text = page.get_text()
                         
-                        if page_text and page_text.strip():  # Only add non-empty pages
+                        if page_text.strip():  # Only add non-empty pages
                             full_text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
                         
                         progress_bar.progress((page_num + 1) / total_pages)
@@ -246,6 +327,7 @@ def extract_text_from_pdf(pdf_file):
                 # Clear progress indicators
                 progress_bar.empty()
                 status_text.empty()
+                doc.close()
             
             # Check if we extracted any text
             if not full_text.strip():
@@ -260,7 +342,7 @@ def extract_text_from_pdf(pdf_file):
             except Exception as save_error:
                 st.error(f"❌ Error saving text file: {str(save_error)}")
             
-            st.success(f"✅ Step 1 Complete: Extracted text from {total_pages} pages")
+            st.success(f"✅ Step 1 Complete: Extracted text from {total_pages} pages using {PDF_LIBRARY}")
             
             return full_text, total_pages
         
@@ -899,6 +981,43 @@ def main():
     # Main content area
     if uploaded_file is None:
         st.info("👈 Please upload a PDF file from the sidebar to begin processing")
+        
+        # Emergency text input option
+        st.markdown("---")
+        st.subheader("🆘 Alternative: Direct Text Input")
+        st.markdown("If PDF processing is not working, you can paste text directly:")
+        
+        text_input = st.text_area(
+            "Paste your text here:",
+            height=200,
+            placeholder="Paste the text you want to analyze..."
+        )
+        
+        if text_input and st.button("🚀 Process Text Directly"):
+            # Save the text as if it came from PDF
+            with open(EXTRACTED_TEXT_FILE, "w", encoding="utf-8") as f:
+                f.write(text_input)
+            
+            st.session_state.pdf_processed = True
+            
+            # Process the text
+            processed_text, sentences = preprocess_text(text_input)
+            
+            if processed_text:
+                success, num_embeddings = store_in_faiss_db(processed_text)
+                
+                if success:
+                    st.session_state.faiss_ready = True
+                    
+                    # Show summary
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Input Length", len(text_input))
+                    with col2:
+                        st.metric("Text Sentences", len(sentences))
+                    with col3:
+                        st.metric("FAISS Vectors", num_embeddings)
+        
         st.markdown("""
         ### How to use this application:
         1. **Upload PDF**: Use the sidebar to upload your PDF file
